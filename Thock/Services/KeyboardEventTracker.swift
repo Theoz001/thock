@@ -33,7 +33,13 @@ class KeyboardEventTracker {
                 let tracker = Unmanaged<KeyboardEventTracker>.fromOpaque(userInfo!).takeUnretainedValue()
                 
                 if type.rawValue == 0xFFFFFFFE || type.rawValue == 0xFFFFFFFF {
-                    DispatchQueue.main.async { tracker.stopTracking() }
+                    DispatchQueue.main.async {
+                        tracker.stopTracking()
+                        // Auto-restart after a short delay to recover from system disabling the tap
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                            tracker.startTracking()
+                        }
+                    }
                     return nil
                 }
                 

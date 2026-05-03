@@ -149,7 +149,7 @@ final class SettingsEngine {
     
     func getVolume(for deviceUID: String) -> Float {
         let perDeviceVolumes = SettingsManager.shared.perDeviceVolumes
-        return perDeviceVolumes[deviceUID] ?? 0.5
+        return perDeviceVolumes[deviceUID] ?? 1.0
     }
     
     func setVolume(_ volume: Float, for deviceUID: String) {
