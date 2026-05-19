@@ -760,12 +760,12 @@ final class SoundManager {
         for i in 0..<sampleCount {
             // Relaxed soft clipping: only compresses when significantly above ±1.0
             let x = buffer[i]
-            if x > 2.0 {
-                buffer[i] = 2.0 + tanh(x - 2.0) * 0.3
-            } else if x < -2.0 {
-                buffer[i] = -2.0 - tanh(-x - 2.0) * 0.3
+            if x > 3.0 {
+                buffer[i] = 3.0 + tanh(x - 3.0) * 0.3
+            } else if x < -3.0 {
+                buffer[i] = -3.0 - tanh(-x - 3.0) * 0.3
             }
-            // Values within ±2.0 pass through unchanged
+            // Values within ±3.0 pass through unchanged
         }
     }
 
@@ -974,7 +974,7 @@ final class SoundManager {
         
         let frameCount = Int(buffer.frameLength)
         let inputChannelCount = Int(buffer.format.channelCount)
-        let gain: Float = 6.0  // Pre-amplify audio samples at load time
+        let gain: Float = 8.0  // Pre-amplify audio samples at load time
         
         var stereoData: [Float] = []
         stereoData.reserveCapacity(frameCount * 2)
