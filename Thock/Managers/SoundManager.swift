@@ -24,6 +24,7 @@ final class SoundManager {
     private var idleTimeoutTimer: DispatchSourceTimer?
     private let timerLock = NSLock()
     private let queueStateLock = NSLock() // Protects audioQueue, isQueueRunning, isReady, initRetryCount and audioQueueGeneration
+    private let restartLock = NSLock()    // Serializes restartQueue and stopQueueIfIdle to prevent race conditions
     
     // MARK: - Audio Format
     private var sampleRate: Float64 = 44100.0
@@ -39,12 +40,10 @@ final class SoundManager {
     private var mouseSoundLibrary: [MouseButtonEvent: [PCMSound]] = [:]
     private var activeSounds: [ActiveSound] = []
     private let activeSoundsLock = NSLock()
-    
-    // MARK: - Idle State Tracking
-    private var idleCallbackCount: Int = 0
+    private let maxActiveSounds = 8  // Limit concurrent sounds to prevent audio overload
     
     // MARK: - Volume Control
-    private var volume: Float = 0.5
+    private var volume: Float = 1.0
     private let volumeLock = NSLock()
     
     // MARK: - Models
@@ -322,9 +321,37 @@ final class SoundManager {
             Logger.audio.debug("Queue was reinitialized, aborting stop")
             return
         }
+
+        // A key could have arrived while we were preparing to stop.
+        activeSoundsLock.lock()
+        let stillIdle = activeSounds.isEmpty
+        activeSoundsLock.unlock()
+
+        guard stillIdle else {
+            Logger.audio.debug("Queue stop aborted because playback resumed")
+            return
+        }
+        
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        
+        // Re-validate state under lock to avoid racing with restartQueue
+        queueStateLock.lock()
+        let queueStillValid = (audioQueueGeneration == generation && isQueueRunning)
+        queueStateLock.unlock()
+        guard queueStillValid else {
+            Logger.audio.debug("Queue state changed while acquiring restartLock, aborting stop")
+            return
+        }
         
         let status = AudioQueueStop(queue, true)
         if status == noErr {
+            // Clear buffers to prevent stale audio from leaking on restart
+            for buffer in audioBuffers {
+                let bufferData = buffer.pointee.mAudioData
+                memset(bufferData, 0, Int(framesPerBuffer * audioFormat.mBytesPerFrame))
+            }
+            
             queueStateLock.lock()
             // Update state only if queue hasnt been reinitialized
             if audioQueueGeneration == generation {
@@ -340,6 +367,9 @@ final class SoundManager {
     }
     
     private func restartQueue() {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        
         queueStateLock.lock()
         let isRunning = isQueueRunning
         let queue = audioQueue
@@ -358,8 +388,7 @@ final class SoundManager {
             return
         }
         
-        idleCallbackCount = 0
-        // Re-prime all buffers
+        // Re-prime all buffers (they were already cleared by stopQueueIfIdle)
         Logger.audio.debug("Re-priming \(self.audioBuffers.count) buffers before restart")
         for buffer in audioBuffers {
             primeBuffer(buffer, queue: queue)
@@ -488,8 +517,8 @@ final class SoundManager {
             &audioFormat,
             audioQueueCallback,
             selfPointer,
-            CFRunLoopGetMain(),
-            CFRunLoopMode.commonModes.rawValue,
+            nil,
+            nil,
             0,
             &audioQueue
         )
@@ -602,22 +631,15 @@ final class SoundManager {
         activeSoundsLock.lock()
         
         if activeSounds.isEmpty {
-            // No active sounds, output silence and return early
-            let shouldClear = idleCallbackCount < numberOfBuffers
-            idleCallbackCount += 1
             activeSoundsLock.unlock()
-            
-            if shouldClear {
-                memset(outputBuffer, 0, Int(framesPerBuffer * audioFormat.mBytesPerFrame))
-            }
-            
+
+            // Always clear idle buffers to avoid stale samples leaking into the next cycle.
+            memset(outputBuffer, 0, Int(framesPerBuffer * audioFormat.mBytesPerFrame))
             buffer.pointee.mAudioDataByteSize = framesPerBuffer * audioFormat.mBytesPerFrame
             AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
             return
         }
-        
-        idleCallbackCount = 0
-        
+
         // Zero out buffer
         memset(outputBuffer, 0, Int(framesPerBuffer * audioFormat.mBytesPerFrame))
         
@@ -663,13 +685,16 @@ final class SoundManager {
         let initialCount = activeSounds.count
         activeSounds.removeAll(where: { $0.isFinished })
         let finishedCount = initialCount - activeSounds.count
-        
+
         activeSoundsLock.unlock()
-        
+
         if finishedCount > 0 {
             Logger.audio.debug("Removed \(finishedCount) finished sounds, \(self.activeSounds.count) still active")
         }
-        
+
+        // Apply soft clipping to prevent distortion when multiple sounds overlap
+        applySoftClipping(outputBuffer, frameCount: frameCount)
+
         // Set buffer size and enqueue
         buffer.pointee.mAudioDataByteSize = framesPerBuffer * audioFormat.mBytesPerFrame
         AudioQueueEnqueueBuffer(queue, buffer, 0, nil)
@@ -726,7 +751,24 @@ final class SoundManager {
             sound.currentFrame += framesConsumed
         }
     }
-    
+
+    // MARK: - Soft Clipping
+
+    /// Applies soft clipping with a higher threshold to allow more gain headroom
+    private func applySoftClipping(_ buffer: UnsafeMutablePointer<Float>, frameCount: Int) {
+        let sampleCount = frameCount * Int(channelCount)
+        for i in 0..<sampleCount {
+            // Relaxed soft clipping: only compresses when significantly above ±1.0
+            let x = buffer[i]
+            if x > 2.0 {
+                buffer[i] = 2.0 + tanh(x - 2.0) * 0.3
+            } else if x < -2.0 {
+                buffer[i] = -2.0 - tanh(-x - 2.0) * 0.3
+            }
+            // Values within ±2.0 pass through unchanged
+        }
+    }
+
     private func primeBuffer(_ buffer: AudioQueueBufferRef, queue: AudioQueueRef) {
         // Fill with silence and enqueue
         let bufferData = buffer.pointee.mAudioData
@@ -751,46 +793,50 @@ final class SoundManager {
             Logger.audio.warning("Sound file not found: '\(name)'")
             return
         }
-        
-        // Restart queue if stopped due to idle timeout
+
         queueStateLock.lock()
-        let isRunning = isQueueRunning
-        let stillReady = isReady // could have changed during device reinit
+        let stillReady = isReady
         queueStateLock.unlock()
-        
-        if stillReady && !isRunning {
-            restartQueue()
-        } else if stillReady && isRunning {
-            resetIdleTimer()
-        } else {
+
+        guard stillReady else {
             Logger.audio.debug("Playback blocked: audio system became not ready during play()")
             return
         }
-        
+
         if ENABLE_LATENCY_MEASUREMENT {
             recordLatencyCheckpoint(latencyId, point: .bufferScheduling)
         }
-        
-        // Gen pitch offset [-variation, +variation]
+
+        // Gen pitch offset [-variation, +variation] (symmetric range)
         let pitchOffset: Float
         if pitchVariation > 0.0 {
             pitchOffset = Float.random(in: -pitchVariation...pitchVariation)
         } else {
             pitchOffset = 0.0
         }
-        
+
         let activeSound = ActiveSound(
             pcmData: pcmSound.data,
             frameCount: pcmSound.frameCount,
             latencyId: latencyId,
             pitchOffset: pitchOffset
         )
-        
+
         activeSoundsLock.lock()
+        let currentCount = activeSounds.count
+        if currentCount >= maxActiveSounds {
+            // Too many concurrent sounds, skip this one to prevent audio overload
+            activeSoundsLock.unlock()
+            Logger.audio.debug("Skipping sound: \(currentCount) active sounds (max: \(self.maxActiveSounds))")
+            return
+        }
         activeSounds.append(activeSound)
         activeSoundsLock.unlock()
+
+        resetIdleTimer()
+        restartQueue()
     }
-    
+
     func preloadSounds(for soundpack: Soundpack) {
         soundLibrary.removeAll()
         
@@ -856,46 +902,44 @@ final class SoundManager {
         let ready = isReady
         queueStateLock.unlock()
         
-        guard ready else {
-            Logger.audio.warning("Mouse sound blocked: audio system not ready")
-            return
-        }
-        
-        // Restart queue if stopped due to idle timeout
         queueStateLock.lock()
-        let isRunning = isQueueRunning
         let stillReady = isReady
         queueStateLock.unlock()
-        
-        if stillReady && !isRunning {
-            restartQueue()
-        } else if stillReady && isRunning {
-            resetIdleTimer()
-        } else {
+
+        guard stillReady else {
             Logger.audio.debug("Mouse sound blocked: audio system became not ready")
             return
         }
-        
+
         // Get pitch variation
         let pitchVariation = SettingsEngine.shared.getPitchVariation()
-        
+
         let pitchOffset: Float
         if pitchVariation > 0.0 {
-            pitchOffset = Float.random(in: -pitchVariation...pitchVariation)
+            pitchOffset = Float.random(in: -pitchVariation...pitchVariation)  // symmetric range
         } else {
             pitchOffset = 0.0
         }
-        
+
         let activeSound = ActiveSound(
             pcmData: sound.data,
             frameCount: sound.frameCount,
             latencyId: nil,
             pitchOffset: pitchOffset
         )
-        
+
         activeSoundsLock.lock()
+        let currentCount = activeSounds.count
+        if currentCount >= maxActiveSounds {
+            activeSoundsLock.unlock()
+            Logger.audio.debug("Skipping mouse sound: \(currentCount) active sounds (max: \(self.maxActiveSounds))")
+            return
+        }
         activeSounds.append(activeSound)
         activeSoundsLock.unlock()
+
+        resetIdleTimer()
+        restartQueue()
     }
     
     // MARK: - Sound Loading
@@ -930,6 +974,7 @@ final class SoundManager {
         
         let frameCount = Int(buffer.frameLength)
         let inputChannelCount = Int(buffer.format.channelCount)
+        let gain: Float = 6.0  // Pre-amplify audio samples at load time
         
         var stereoData: [Float] = []
         stereoData.reserveCapacity(frameCount * 2)
@@ -938,7 +983,7 @@ final class SoundManager {
             // Mono to stereo: duplicate channel
             let monoData = floatChannelData[0]
             for frame in 0..<frameCount {
-                let sample = monoData[frame]
+                let sample = monoData[frame] * gain
                 stereoData.append(sample)  // Left
                 stereoData.append(sample)  // Right
             }
@@ -947,16 +992,16 @@ final class SoundManager {
             let leftData = floatChannelData[0]
             let rightData = floatChannelData[1]
             for frame in 0..<frameCount {
-                stereoData.append(leftData[frame])   // Left
-                stereoData.append(rightData[frame])  // Right
+                stereoData.append(leftData[frame] * gain)   // Left
+                stereoData.append(rightData[frame] * gain)  // Right
             }
         } else {
             // More than 2 channels: take first two
             let leftData = floatChannelData[0]
             let rightData = floatChannelData[1]
             for frame in 0..<frameCount {
-                stereoData.append(leftData[frame])
-                stereoData.append(rightData[frame])
+                stereoData.append(leftData[frame] * gain)
+                stereoData.append(rightData[frame] * gain)
             }
         }
         

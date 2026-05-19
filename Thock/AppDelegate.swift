@@ -181,6 +181,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, MenuBarControllerDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             AudioDeviceManager.shared.enumerateAndCacheDevices()
             SoundManager.shared.reinitializeAfterWake()
+            self.keyboardEventTracker?.stopTracking()
+            self.keyboardEventTracker?.startTracking()
+            self.mouseEventTracker?.stopTracking()
+            self.mouseEventTracker?.startTrackingIfEnabled()
         }
     }
 }
